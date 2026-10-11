@@ -71,6 +71,33 @@ const config = require('./config.js');
 if (typeof global.antivvEnabled === 'undefined') global.antivvEnabled = config.ANTIVV !== false;
 const store = makeInMemoryStore({ logger: P({ level: 'silent' }) });
 
+const FALLBACK_WA_VERSION = [2, 3000, 1027934701];
+if (!global.__silvaListenerGuard) {
+    process.setMaxListeners(0);
+    global.__silvaListenerGuard = true;
+}
+
+function cleanupSockListeners(sock) {
+    if (!sock || !sock.ev) return;
+    for (const eventName of [
+        'connection.update',
+        'creds.update',
+        'messages.upsert',
+        'messages.update',
+        'messages.delete',
+        'contacts.upsert',
+        'contacts.update',
+        'messaging-history.set',
+        'group-participants.update'
+    ]) {
+        try {
+            sock.ev.removeAllListeners(eventName);
+        } catch (e) {
+            // ignore
+        }
+    }
+}
+
 const prefix = config.PREFIX || '.';
 const tempDir = path.join(os.tmpdir(), 'silva-cache');
 const port = process.env.PORT || 25680;
@@ -352,7 +379,43 @@ async function connectToWhatsApp() {
 
     // Use the session directory for multi-file auth state
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
-    const { version } = await fetchLatestBaileysVersion();
+
+    // ✅ FIX: dynamic Baileys version with fallback
+    let version = FALLBACK_WA_VERSION.slice();
+    try {
+        const { version: fetchedVersion } = await fetchLatestBaileysVersion();
+        if (Array.isArray(fetchedVersion) && fetchedVersion.length === 3) {
+            version = fetchedVersion;
+            logMessage('INFO', `✅ WA version fetched: ${version.join('.')}`);
+        }
+    } catch (e) {
+        logMessage('WARN', `fetchLatestBaileysVersion() failed: ${e.message} — using fallback ${version.join('.')}`);
+    }
+
+    // Always try upstream version source as final fallback
+    try {
+        const _https = require('https');
+        await new Promise((resolve) => {
+            _https.get('https://raw.githubusercontent.com/WhiskeySockets/Baileys/master/src/Defaults/baileys-version.json', (r) => {
+                let d = ''; r.on('data', c => d += c);
+                r.on('end', () => {
+                    try {
+                        const parsed = JSON.parse(d);
+                        if (Array.isArray(parsed.version) && parsed.version.length === 3) {
+                            version = parsed.version;
+                            logMessage('INFO', `✅ WA version (upstream): ${version.join('.')}`);
+                        }
+                    } catch (e) {
+                        logMessage('WARN', `Could not parse upstream Baileys version: ${e.message}`);
+                    }
+                    resolve();
+                });
+                r.on('error', () => resolve());
+            }).on('error', () => resolve()).setTimeout(8000, function() { this.destroy(); resolve(); });
+        });
+    } catch (e) {
+        logMessage('WARN', `Upstream version fetch failed: ${e.message}`);
+    }
 
     const cryptoOptions = {
         maxSharedKeys: 1000,
@@ -363,6 +426,7 @@ async function connectToWhatsApp() {
         }
     };
 
+    process.setMaxListeners(0);
     const sock = makeWASocket({
         logger: P({ level: config.DEBUG ? 'debug' : 'silent' }),
         printQRInTerminal: false,
@@ -443,8 +507,13 @@ async function connectToWhatsApp() {
         }, 30000);
     }
 
-    process.once('SIGINT', () => { flushCachesToDisk(); process.exit(0); });
-    process.once('SIGTERM', () => { flushCachesToDisk(); process.exit(0); });
+    if (!global.__silvaSignalHandlersRegistered) {
+        global.__silvaSignalHandlersRegistered = true;
+        process.removeAllListeners('SIGINT');
+        process.removeAllListeners('SIGTERM');
+        process.once('SIGINT', () => { flushCachesToDisk(); process.exit(0); });
+        process.once('SIGTERM', () => { flushCachesToDisk(); process.exit(0); });
+    }
 
     const trackContacts = (contacts, source) => {
         let mapped = 0;
@@ -490,6 +559,7 @@ async function connectToWhatsApp() {
     sock.ev.on('connection.update', async update => {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
+            cleanupSockListeners(sock);
             logMessage('WARN', `Connection closed: ${lastDisconnect?.error?.output?.statusCode || 'Unknown'}`);
             if (lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) {
                 logMessage('INFO', 'Reconnecting...');
@@ -1094,7 +1164,7 @@ process.on('unhandledRejection', (reason, promise) => {
         console.log('╔══════════════════════════════════════════╗');
         console.log('║  ____  _ _                 __  __ ____   ║');
         console.log('║ / ___|| (_)_   ____ _     |  \\/  |  _ \\  ║');
-        console.log('║ \\___ \\| | \\ \\ / / _` |    | |\\/| | | | | ║');
+        console.log('║ \\___ \\| | \\\\ / / _` |    | |\\/| | | | | ║');
         console.log('║  ___) | | |\\ V / (_| |    | |  | | |_| | ║');
         console.log('║ |____/|_|_| \\_/ \\__,_|    |_|  |_|____/  ║');
         console.log('║                                            ║');
